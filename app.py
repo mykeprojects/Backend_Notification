@@ -221,10 +221,18 @@ def notify() -> tuple[Any, int]:
             get_gmail_service(), recipient.strip(), content, subject.strip()
         )
     except (FileNotFoundError, GoogleAuthError, HttpError, OSError, pickle.UnpicklingError):
-        app.logger.exception("No fue posible enviar la notificación")
-        return jsonify(error="No fue posible enviar el correo."), 500
+        app.logger.exception("No fue posible enviar la notificación por Gmail")
+        print(
+            f"[NOTIFICACION-LOCAL] para={recipient} asunto={subject}\n{content}",
+            flush=True,
+        )
+        return jsonify(
+            mensaje="Notificación registrada en modo local. Gmail no está disponible.",
+            id="fallback-local",
+            modo="local",
+        ), 200
 
-    return jsonify(mensaje="Correo enviado correctamente.", id=message_id), 200
+    return jsonify(mensaje="Correo enviado correctamente.", id=message_id, modo="gmail"), 200
 
 
 if __name__ == "__main__":
