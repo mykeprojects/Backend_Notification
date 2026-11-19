@@ -4,6 +4,8 @@ import base64
 import html
 import os
 import pickle
+import sqlite3
+from datetime import datetime, timedelta, timezone
 from email.mime.text import MIMEText
 from email.utils import parseaddr
 from threading import Lock
@@ -22,13 +24,19 @@ BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 CREDENTIALS_DIR = os.path.join(BASE_DIR, "credentials")
 CLIENT_SECRET_FILE = os.path.join(CREDENTIALS_DIR, "credentials.json")
 TOKEN_FILE = os.path.join(CREDENTIALS_DIR, "token.pickle")
+NOTIFICATION_DB_PATH = os.getenv(
+    "NOTIFICATION_DB_PATH", os.path.join(CREDENTIALS_DIR, "notifications.db")
+)
+PROCESSING_TTL_SECONDS = int(os.getenv("NOTIFICATION_PROCESSING_TTL_SECONDS", "300"))
 SENDER_EMAIL = os.getenv(
-    "GMAIL_SENDER_EMAIL", "michael.ramirez63421@autonoma.edu.co"
+    "GMAIL_SENDER_EMAIL", "sergio.bedoya46815@ucaldas.edu.co"
 )
 
 app = Flask(__name__)
 _service: Resource | None = None
 _service_lock = Lock()
+_db_lock = Lock()
+_db_ready = False
 
 
 def authenticate_gmail() -> Any:
@@ -57,6 +65,153 @@ def authenticate_gmail() -> Any:
             pickle.dump(credentials, token_file)
 
     return credentials
+
+
+def _utc_now_iso() -> str:
+    return datetime.now(timezone.utc).replace(microsecond=0).isoformat()
+
+
+def init_notification_db() -> None:
+    global _db_ready
+    if _db_ready:
+        return
+    with _db_lock:
+        if _db_ready:
+            return
+        db_dir = os.path.dirname(os.path.abspath(NOTIFICATION_DB_PATH))
+        if db_dir:
+            os.makedirs(db_dir, exist_ok=True)
+        conn = sqlite3.connect(NOTIFICATION_DB_PATH, timeout=30)
+        try:
+            conn.execute("PRAGMA journal_mode=WAL")
+            conn.execute("PRAGMA busy_timeout=5000")
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS processed_notifications (
+                    idempotency_key TEXT PRIMARY KEY,
+                    status TEXT NOT NULL CHECK(status IN ('processing','sent','failed')),
+                    message_id TEXT,
+                    recipient TEXT,
+                    subject TEXT,
+                    processing_started_at TEXT,
+                    updated_at TEXT,
+                    created_at TEXT,
+                    last_error TEXT
+                )
+                """
+            )
+            conn.commit()
+        finally:
+            conn.close()
+        _db_ready = True
+
+
+def _db_conn() -> sqlite3.Connection:
+    init_notification_db()
+    conn = sqlite3.connect(NOTIFICATION_DB_PATH, timeout=30)
+    conn.row_factory = sqlite3.Row
+    return conn
+
+
+def claim_notification(key: str, recipient: str, subject: str) -> tuple[str, str | None]:
+    """Claim a notification key. Returns (state, message_id). state in {claimed,sent,processing}."""
+    now = _utc_now_iso()
+    stale_before = (
+        datetime.now(timezone.utc) - timedelta(seconds=max(PROCESSING_TTL_SECONDS, 1))
+    ).replace(microsecond=0).isoformat()
+    with _db_lock:
+        conn = _db_conn()
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            row = conn.execute(
+                "SELECT status, message_id, processing_started_at FROM processed_notifications WHERE idempotency_key = ?",
+                (key,),
+            ).fetchone()
+            if row is None:
+                conn.execute(
+                    """
+                    INSERT INTO processed_notifications
+                        (idempotency_key, status, recipient, subject, processing_started_at, created_at, updated_at)
+                    VALUES (?, 'processing', ?, ?, ?, ?, ?)
+                    """,
+                    (key, recipient, subject, now, now, now),
+                )
+                conn.commit()
+                return ("claimed", None)
+
+            status = row["status"]
+            if status == "sent":
+                conn.commit()
+                return ("sent", row["message_id"])
+
+            if status == "processing":
+                started = row["processing_started_at"] or ""
+                if started and started < stale_before:
+                    cur = conn.execute(
+                        """
+                        UPDATE processed_notifications
+                        SET status='processing', recipient=?, subject=?, processing_started_at=?, updated_at=?, last_error=NULL
+                        WHERE idempotency_key=? AND status='processing'
+                        """,
+                        (recipient, subject, now, now, key),
+                    )
+                    if cur.rowcount:
+                        conn.commit()
+                        return ("claimed", None)
+                conn.commit()
+                return ("processing", None)
+
+            if status == "failed":
+                cur = conn.execute(
+                    """
+                    UPDATE processed_notifications
+                    SET status='processing', recipient=?, subject=?, processing_started_at=?, updated_at=?, last_error=NULL
+                    WHERE idempotency_key=? AND status='failed'
+                    """,
+                    (recipient, subject, now, now, key),
+                )
+                if cur.rowcount:
+                    conn.commit()
+                    return ("claimed", None)
+
+            conn.commit()
+            return ("processing", None)
+        except Exception:
+            try:
+                conn.execute("ROLLBACK")
+            except Exception:
+                pass
+            raise
+        finally:
+            conn.close()
+
+
+def mark_notification_sent(key: str, message_id: str) -> None:
+    now = _utc_now_iso()
+    with _db_lock:
+        conn = _db_conn()
+        try:
+            conn.execute(
+                "UPDATE processed_notifications SET status='sent', message_id=?, updated_at=?, last_error=NULL WHERE idempotency_key=?",
+                (message_id, now, key),
+            )
+            conn.commit()
+        finally:
+            conn.close()
+
+
+def mark_notification_failed(key: str, error_text: str) -> None:
+    now = _utc_now_iso()
+    with _db_lock:
+        conn = _db_conn()
+        try:
+            conn.execute(
+                "UPDATE processed_notifications SET status='failed', updated_at=?, last_error=? WHERE idempotency_key=?",
+                (now, str(error_text)[:1000], key),
+            )
+            conn.commit()
+        finally:
+            conn.close()
 
 
 def get_gmail_service() -> Resource:
@@ -208,6 +363,7 @@ def notify() -> tuple[Any, int]:
     recipient = data.get("para")
     content = data.get("contenido")
     subject = data.get("asunto", "Notificación")
+    idempotency_key = data.get("idempotency_key")
 
     if not is_valid_email(recipient):
         return jsonify(error="El campo 'para' debe ser un correo válido."), 400
@@ -215,24 +371,130 @@ def notify() -> tuple[Any, int]:
         return jsonify(error="El campo 'contenido' es obligatorio."), 400
     if not isinstance(subject, str) or not subject.strip():
         return jsonify(error="El campo 'asunto' debe ser un texto no vacío."), 400
+    if idempotency_key is not None and (
+        not isinstance(idempotency_key, str) or not idempotency_key.strip()
+    ):
+        return jsonify(
+            error="El campo 'idempotency_key' debe ser un texto no vacío.",
+            estado="failed",
+            procesada=False,
+        ), 400
+    if isinstance(idempotency_key, str):
+        idempotency_key = idempotency_key.strip()
+
+    if idempotency_key:
+        try:
+            state, existing_message_id = claim_notification(
+                idempotency_key, recipient.strip(), subject.strip()
+            )
+        except Exception:
+            app.logger.exception("No fue posible registrar la clave de idempotencia")
+            return (
+                jsonify(
+                    error="No fue posible registrar la solicitud de notificación.",
+                    estado="failed",
+                    procesada=False,
+                ),
+                500,
+            )
+        if state == "sent":
+            return (
+                jsonify(
+                    mensaje="Notificación ya procesada.",
+                    id=existing_message_id,
+                    duplicado=True,
+                    estado="sent",
+                    procesada=True,
+                ),
+                200,
+            )
+        if state == "processing":
+            return (
+                jsonify(
+                    error="Notificación en procesamiento.",
+                    estado="processing",
+                    procesada=False,
+                    duplicado=True,
+                ),
+                409,
+            )
+        # state == 'claimed': continuar con el envío controlado
 
     try:
         message_id = send_notification(
             get_gmail_service(), recipient.strip(), content, subject.strip()
         )
-    except (FileNotFoundError, GoogleAuthError, HttpError, OSError, pickle.UnpicklingError):
+    except FileNotFoundError:
         app.logger.exception("No fue posible enviar la notificación por Gmail")
-        print(
-            f"[NOTIFICACION-LOCAL] para={recipient} asunto={subject}\n{content}",
-            flush=True,
-        )
-        return jsonify(
-            mensaje="Notificación registrada en modo local. Gmail no está disponible.",
-            id="fallback-local",
-            modo="local",
-        ), 200
+        if idempotency_key:
+            try:
+                mark_notification_failed(idempotency_key, "credentials_missing")
+            except Exception:
+                app.logger.exception("No fue posible marcar la notificación como fallida")
+        response = {
+            "error": "No se encontró el archivo credentials/credentials.json.",
+        }
+        if idempotency_key:
+            response.update({"estado": "failed", "procesada": False})
+        return jsonify(response), 500
+    except (GoogleAuthError, HttpError):
+        app.logger.exception("No fue posible enviar la notificación por Gmail")
+        if idempotency_key:
+            try:
+                mark_notification_failed(idempotency_key, "gmail_error")
+            except Exception:
+                app.logger.exception("No fue posible marcar la notificación como fallida")
+        response = {"error": "No fue posible enviar el correo mediante Gmail."}
+        if idempotency_key:
+            response.update({"estado": "failed", "procesada": False})
+        return jsonify(response), 502
+    except (OSError, pickle.UnpicklingError):
+        app.logger.exception("No fue posible leer o guardar las credenciales de Gmail")
+        if idempotency_key:
+            try:
+                mark_notification_failed(idempotency_key, "credentials_io_error")
+            except Exception:
+                app.logger.exception("No fue posible marcar la notificación como fallida")
+        response = {
+            "error": "No fue posible leer o guardar las credenciales de Gmail.",
+        }
+        if idempotency_key:
+            response.update({"estado": "failed", "procesada": False})
+        return jsonify(response), 500
 
-    return jsonify(mensaje="Correo enviado correctamente.", id=message_id, modo="gmail"), 200
+    if idempotency_key:
+        try:
+            mark_notification_sent(idempotency_key, message_id)
+        except Exception:
+            app.logger.exception(
+                "Correo enviado pero no fue posible registrar la entrega idempotente"
+            )
+            try:
+                mark_notification_failed(idempotency_key, "persist_sent_failed")
+            except Exception:
+                app.logger.exception(
+                    "No fue posible marcar la notificación como fallida"
+                )
+            return (
+                jsonify(
+                    error="No fue posible registrar la entrega de la notificación.",
+                    estado="failed",
+                    procesada=False,
+                ),
+                500,
+            )
+        return (
+            jsonify(
+                mensaje="Correo enviado correctamente.",
+                id=message_id,
+                duplicado=False,
+                estado="sent",
+                procesada=True,
+            ),
+            200,
+        )
+
+    return jsonify(mensaje="Correo enviado correctamente.", id=message_id), 200
 
 
 if __name__ == "__main__":
