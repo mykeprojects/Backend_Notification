@@ -237,8 +237,62 @@ def create_message_html(
     return {"raw": encoded_message}
 
 
-def build_notification_html(content: str) -> str:
-    """Construye la plantilla del correo usando contenido de texto seguro."""
+def get_notification_presentation(subject: str) -> dict[str, str]:
+    normalized = subject.strip().lower()
+    if "recuper" in normalized or "contraseña" in normalized or "password" in normalized:
+        return {
+            "accent": "#2563eb",
+            "eyebrow": "Recuperación de contraseña",
+            "title": "Recupera el acceso a tu cuenta",
+            "intro": "Usa el código siguiente para completar la recuperación de tu contraseña.",
+        }
+    if "dos factores" in normalized or "2fa" in normalized or "verificación" in normalized:
+        return {
+            "accent": "#18a66a",
+            "eyebrow": "Verificación de dos factores",
+            "title": "Verifica tu identidad",
+            "intro": "Usa el siguiente código para acceder de forma segura a Sports System.",
+        }
+    if "apuesta cancelada" in normalized or "cancelada" in normalized:
+        return {
+            "accent": "#64748b",
+            "eyebrow": "Resultado de la apuesta",
+            "title": "Tu apuesta fue cancelada",
+            "intro": "La apuesta quedó cancelada y se realizó el ajuste correspondiente.",
+        }
+    if "apost" in normalized and ("ganada" in normalized or "ganó" in normalized or "won" in normalized):
+        return {
+            "accent": "#16a34a",
+            "eyebrow": "Resultado de la apuesta",
+            "title": "¡Ganaste tu apuesta!",
+            "intro": "Tu selección fue acertada y se calculó el valor recibido.",
+        }
+    if "apost" in normalized and ("perdida" in normalized or "perdió" in normalized or "lost" in normalized):
+        return {
+            "accent": "#dc2626",
+            "eyebrow": "Resultado de la apuesta",
+            "title": "Tu apuesta no fue ganadora",
+            "intro": "La selección no coincidió con el resultado del partido.",
+        }
+    if "apuesta registrada" in normalized or ("apuesta" in normalized and "registrada" in normalized):
+        return {
+            "accent": "#7c3aed",
+            "eyebrow": "Apuesta registrada",
+            "title": "Tu apuesta quedó registrada",
+            "intro": "Estos son los detalles confirmados de tu apuesta.",
+        }
+    return {
+        "accent": "#18a66a",
+        "eyebrow": "Sports System",
+        "title": "Nueva notificación",
+        "intro": "Tienes una nueva actualización en Sports System.",
+    }
+
+
+def build_notification_html(content: str, subject: str) -> str:
+    """Construye la plantilla del correo usando contenido seguro y contexto específico."""
+    presentation = get_notification_presentation(subject)
+    accent = presentation["accent"]
     escaped_content = html.escape(content).replace("\n", "<br>\n")
     return f"""\
 <!DOCTYPE html>
@@ -275,21 +329,21 @@ def build_notification_html(content: str) -> str:
                         <td style="background-color: #ffffff; border: 1px solid #dfe7ec; border-radius: 14px; box-shadow: 0 6px 20px rgba(23, 33, 43, 0.06); overflow: hidden;">
                             <table role="presentation" width="100%" cellpadding="0" cellspacing="0" border="0">
                                 <tr>
-                                    <td style="height: 6px; background-color: #18a66a; font-size: 0; line-height: 0;">&nbsp;</td>
+                                    <td style="height: 6px; background-color: {accent}; font-size: 0; line-height: 0;">&nbsp;</td>
                                 </tr>
                                 <tr>
                                     <td style="padding: 38px 42px 12px;">
-                                        <p style="margin: 0 0 10px; color: #18a66a; font-size: 12px; font-weight: 800; letter-spacing: 1.4px; text-transform: uppercase;">
-                                            Seguridad de tu cuenta
+                                        <p style="margin: 0 0 10px; color: {accent}; font-size: 12px; font-weight: 800; letter-spacing: 1.4px; text-transform: uppercase;">
+                                            {html.escape(presentation["eyebrow"])}
                                         </p>
                                         <h1 style="margin: 0; color: #17212b; font-size: 28px; line-height: 1.25; letter-spacing: -0.6px;">
-                                            Verifica tu identidad
+                                            {html.escape(presentation["title"])}
                                         </h1>
                                     </td>
                                 </tr>
                                 <tr>
                                     <td style="padding: 0 42px 26px; color: #52616d; font-size: 15px; line-height: 1.6;">
-                                        Usa el siguiente código para continuar de forma segura en Sports System. Este código es personal y tiene una vigencia limitada.
+                                        {html.escape(presentation["intro"])}
                                     </td>
                                 </tr>
                                 <tr>
@@ -336,7 +390,7 @@ def send_notification(
     content: str,
     subject: str,
 ) -> str:
-    html_content = build_notification_html(content)
+    html_content = build_notification_html(content, subject)
     message = create_message_html(SENDER_EMAIL, recipient, subject, html_content)
     sent_message = (
         service.users()
